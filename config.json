@@ -1,0 +1,178 @@
+{
+  "exchanges": [
+    {
+      "id": "binance",
+      "enabled": true,
+      "api_key": "",
+      "secret": "",
+      "options": {"defaultType": "spot"},
+      "trading_fee_pct": 0.1,
+      "withdrawal_fees": {}
+    },
+    {
+      "id": "bybit",
+      "enabled": true,
+      "api_key": "",
+      "secret": "",
+      "options": {"defaultType": "spot"},
+      "trading_fee_pct": 0.1,
+      "withdrawal_fees": {}
+    },
+    {
+      "id": "bitget",
+      "enabled": true,
+      "api_key": "",
+      "secret": "",
+      "options": {"defaultType": "spot"},
+      "trading_fee_pct": 0.1,
+      "withdrawal_fees": {}
+    },
+    {
+      "id": "gateio",
+      "enabled": true,
+      "api_key": "",
+      "secret": "",
+      "options": {"defaultType": "spot"},
+      "trading_fee_pct": 0.2,
+      "withdrawal_fees": {}
+    },
+    {
+      "id": "kucoin",
+      "enabled": true,
+      "api_key": "",
+      "secret": "",
+      "options": {"defaultType": "spot"},
+      "trading_fee_pct": 0.1,
+      "withdrawal_fees": {}
+    },
+    {
+      "id": "mexc",
+      "enabled": true,
+      "api_key": "",
+      "secret": "",
+      "options": {"defaultType": "spot"},
+      "trading_fee_pct": 0.1,
+      "withdrawal_fees": {}
+    },
+    {
+      "id": "huobi",
+      "enabled": true,
+      "api_key": "",
+      "secret": "",
+      "options": {"defaultType": "spot"},
+      "trading_fee_pct": 0.2,
+      "withdrawal_fees": {}
+    },
+    {
+      "id": "coinex",
+      "enabled": true,
+      "api_key": "",
+      "secret": "",
+      "options": {"defaultType": "spot"},
+      "trading_fee_pct": 0.2,
+      "withdrawal_fees": {}
+    },
+    {
+      "id": "cryptocom",
+      "enabled": true,
+      "api_key": "",
+      "secret": "",
+      "options": {"defaultType": "spot"},
+      "trading_fee_pct": 0.075,
+      "withdrawal_fees": {}
+    },
+    {
+      "id": "coinbase",
+      "enabled": true,
+      "api_key": "",
+      "secret": "",
+      "options": {"defaultType": "spot"},
+      "trading_fee_pct": 0.6,
+      "withdrawal_fees": {}
+    },
+    {
+      "id": "exmo",
+      "enabled": true,
+      "api_key": "",
+      "secret": "",
+      "options": {"defaultType": "spot"},
+      "trading_fee_pct": 0.3,
+      "withdrawal_fees": {}
+    },
+    {
+      "id": "hitbtc",
+      "enabled": true,
+      "api_key": "",
+      "secret": "",
+      "options": {"defaultType": "spot"},
+      "trading_fee_pct": 0.1,
+      "withdrawal_fees": {}
+    },
+    {
+      "id": "bitrue",
+      "enabled": true,
+      "api_key": "",
+      "secret": "",
+      "options": {"defaultType": "spot"},
+      "trading_fee_pct": 0.098,
+      "withdrawal_fees": {}
+    },
+    {
+      "id": "okx",
+      "enabled": true,
+      "api_key": "",
+      "secret": "",
+      "options": {"defaultType": "spot"},
+      "trading_fee_pct": 0.1,
+      "withdrawal_fees": {}
+    },
+    {
+      "id": "poloniex",
+      "enabled": true,
+      "api_key": "",
+      "secret": "",
+      "options": {"defaultType": "spot"},
+      "trading_fee_pct": 0.2,
+      "withdrawal_fees": {}
+    }
+  ],
+
+  "scanner": {
+    "symbols": [],
+    "quote_currencies": ["USDT", "USDC"],
+    "min_spread_pct": 0.3,
+    "max_spread_pct": 20.0,
+    "min_volume_24h_usd": 50000,
+    "scan_interval_sec": 10,
+    "orderbook_depth": 20,
+    "position_size_usd": 500,
+    "max_concurrent_requests": 10
+  },
+
+  "lag_monitor": {
+    "enabled": true,
+    "reference_exchanges": ["binance", "okx", "bybit", "coinbase", "kucoin"],
+    "lag_threshold_sec": 1.0,
+    "price_move_pct": 0.05,
+    "fetch_interval_sec": 0.5,
+    "max_symbols": 50
+  },
+
+  "telegram": {
+    "enabled": false,
+    "bot_token": "",
+    "chat_id": "",
+    "min_profit_pct_alert": 0.5,
+    "alert_cooldown_sec": 60
+  },
+
+  "database": {
+    "path": "arbitrage.db"
+  },
+
+  "retry": {
+    "max_retries": 3,
+    "base_delay_sec": 1.0,
+    "max_delay_sec": 30.0
+  }
+}
