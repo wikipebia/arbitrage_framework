@@ -108,6 +108,10 @@ async def run(config: dict, scanner_only: bool, lag_only: bool) -> None:
             max_concurrent=scanner_cfg.get("max_concurrent_requests", 10),
             max_retries=retry_cfg.get("max_retries", 3),
             base_delay=retry_cfg.get("base_delay_sec", 1.0),
+            max_ticker_age_sec=scanner_cfg.get("max_ticker_age_sec", 60.0),
+            max_bid_ask_spread_pct=scanner_cfg.get("max_bid_ask_spread_pct", 3.0),
+            confirm_top_n=scanner_cfg.get("confirm_top_n", 5),
+            confirm_min_spread_pct=scanner_cfg.get("confirm_min_spread_pct", 0.5),
         )
 
         exchange_names = [e["id"] for e in enabled_exchanges]

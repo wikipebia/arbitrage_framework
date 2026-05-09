@@ -146,7 +146,11 @@
     "scan_interval_sec": 10,
     "orderbook_depth": 20,
     "position_size_usd": 500,
-    "max_concurrent_requests": 10
+    "max_concurrent_requests": 10,
+    "max_ticker_age_sec": 60.0,
+    "max_bid_ask_spread_pct": 3.0,
+    "confirm_top_n": 5,
+    "confirm_min_spread_pct": 0.5
   },
 
   "lag_monitor": {

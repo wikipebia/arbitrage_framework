@@ -21,6 +21,8 @@ log = logging.getLogger("arbitrage.lag_monitor")
 
 REFERENCE_WINDOW = 10  # seconds — window for detecting reference price movement
 MAX_LAG_DURATION = 120  # seconds — reset lag after this duration (stale state)
+MAX_EXCHANGE_ERRORS = 15  # skip exchange after this many consecutive failures
+MAX_TICKER_AGE_SEC = 90.0  # reject tickers older than this
 
 
 @dataclass
@@ -41,6 +43,8 @@ class ExchangeState:
     last_log_ts: float = 0.0  # separate throttle for console logs
     last_price: float | None = None
     consecutive_errors: int = 0
+    fetch_latency: float = 0.0
+    dead: bool = False
 
     def add_tick(self, tick: PriceTick) -> None:
         self.history.append(tick)
@@ -180,7 +184,13 @@ class LagMonitor:
         symbol: str,
     ) -> None:
         now = time.monotonic()
-        ref_price = self._get_reference_price(ref_states)
+        active_refs = {
+            n: s for n, s in ref_states.items()
+            if s.last_price is not None and not s.dead
+        }
+        if len(active_refs) < 2:
+            return
+        ref_price = self._get_reference_price(active_refs)
         if ref_price is None:
             return
 
@@ -199,7 +209,7 @@ class LagMonitor:
         moving = abs(pct_move) >= self._price_move_pct
 
         for name, state in lag_states.items():
-            if state.last_price is None:
+            if state.last_price is None or state.dead:
                 continue
 
             if not moving:
@@ -274,9 +284,29 @@ class LagMonitor:
             return
 
         while not stop_event.is_set():
+            if state.dead:
+                await asyncio.sleep(30.0)
+                continue
+
             t0 = time.monotonic()
             try:
                 ticker = await exchange.fetch_ticker(symbol)
+                latency = time.monotonic() - t0
+                state.fetch_latency = latency
+
+                ticker_ts = ticker.get("timestamp")
+                now_ms = time.time() * 1000.0
+                if ticker_ts is not None:
+                    age_sec = abs(now_ms - ticker_ts) / 1000.0
+                    if age_sec > MAX_TICKER_AGE_SEC:
+                        elapsed = time.monotonic() - t0
+                        wait = max(0.0, self._fetch_interval - elapsed)
+                        try:
+                            await asyncio.wait_for(stop_event.wait(), timeout=wait)
+                        except asyncio.TimeoutError:
+                            pass
+                        continue
+
                 price = ticker.get("last") or ticker.get("close")
                 if price and float(price) > 0:
                     state.add_tick(
@@ -289,11 +319,23 @@ class LagMonitor:
                     state.consecutive_errors = 0
             except (ccxt.NetworkError, ccxt.ExchangeError) as e:
                 state.consecutive_errors += 1
-                if state.consecutive_errors <= 3:
+                if state.consecutive_errors >= MAX_EXCHANGE_ERRORS and not state.dead:
+                    state.dead = True
+                    log.warning(
+                        "[%s/%s] marked DEAD after %d errors: %s",
+                        state.name, symbol, state.consecutive_errors, e,
+                    )
+                elif state.consecutive_errors <= 3:
                     log.debug("[%s/%s] %s: %s", state.name, symbol, type(e).__name__, e)
             except Exception as e:
                 state.consecutive_errors += 1
-                if state.consecutive_errors <= 3:
+                if state.consecutive_errors >= MAX_EXCHANGE_ERRORS and not state.dead:
+                    state.dead = True
+                    log.warning(
+                        "[%s/%s] marked DEAD after %d errors: %s",
+                        state.name, symbol, state.consecutive_errors, e,
+                    )
+                elif state.consecutive_errors <= 3:
                     log.debug("[%s/%s] Error: %s", state.name, symbol, e)
 
             elapsed = time.monotonic() - t0

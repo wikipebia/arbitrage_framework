@@ -1,8 +1,14 @@
 """
-Multi-exchange spread scanner.
+Multi-exchange spread scanner with signal validation.
 
 Merged from zapozdavwie.py (CEX-CEX spread monitoring) and scanner.py (CEX-DEX).
 Async architecture with ccxt.async_support, rate-limit awareness, retry logic.
+
+Signal validation:
+  - Ticker freshness: reject tickers older than max_ticker_age_sec
+  - Re-confirmation: re-fetch top opportunities to confirm spread still exists
+  - Bid-ask spread check: wide bid-ask = illiquid, unreliable
+  - Dead exchange detection: skip exchanges with consecutive failures
 """
 
 import asyncio
@@ -17,6 +23,8 @@ from notifications.telegram_bot import TelegramNotifier
 from storage.db import ArbitrageDB
 
 log = logging.getLogger("arbitrage.scanner")
+
+MAX_EXCHANGE_ERRORS = 10
 
 
 def _build_exchange(
@@ -79,11 +87,12 @@ class SpreadScanner:
     Scans multiple exchanges for spread-based arbitrage opportunities.
 
     Workflow per cycle:
-      1. Fetch tickers from all exchanges in parallel
-      2. Group by symbol, filter by volume
-      3. Compare ask/bid across exchanges
+      1. Fetch tickers from all exchanges in parallel (record fetch timestamps)
+      2. Group by symbol, filter by volume AND ticker freshness
+      3. Compare ask/bid across exchanges, check bid-ask spread health
       4. Calculate net profit via ProfitCalculator
-      5. Log to DB, send Telegram alerts
+      5. Re-confirm top opportunities by re-fetching individual tickers
+      6. Log to DB, send Telegram alerts only for confirmed opportunities
     """
 
     def __init__(
@@ -101,6 +110,10 @@ class SpreadScanner:
         max_concurrent: int = 10,
         max_retries: int = 3,
         base_delay: float = 1.0,
+        max_ticker_age_sec: float = 60.0,
+        max_bid_ask_spread_pct: float = 3.0,
+        confirm_top_n: int = 5,
+        confirm_min_spread_pct: float = 0.5,
     ):
         self._exchange_configs = exchange_configs
         self._calculator = calculator
@@ -115,7 +128,13 @@ class SpreadScanner:
         self._max_concurrent = max_concurrent
         self._max_retries = max_retries
         self._base_delay = base_delay
+        self._max_ticker_age = max_ticker_age_sec
+        self._max_bid_ask_spread = max_bid_ask_spread_pct
+        self._confirm_top_n = confirm_top_n
+        self._confirm_min_spread = confirm_min_spread_pct
         self._exchanges: dict[str, ccxt.Exchange] = {}
+        self._exchange_errors: dict[str, int] = defaultdict(int)
+        self._exchange_fetch_latency: dict[str, float] = {}
         self._running = False
 
     async def _init_exchanges(self) -> None:
@@ -144,6 +163,7 @@ class SpreadScanner:
 
     async def _load_markets(self) -> None:
         sem = asyncio.Semaphore(5)
+        failed: list[str] = []
 
         async def _load_one(name: str, ex: ccxt.Exchange) -> None:
             async with sem:
@@ -152,11 +172,27 @@ class SpreadScanner:
                     log.info("[%s] loaded %d markets", name, len(ex.markets))
                 except Exception as e:
                     log.warning("[%s] load_markets failed: %s", name, e)
+                    failed.append(name)
 
         await asyncio.gather(
             *[_load_one(n, e) for n, e in self._exchanges.items()],
             return_exceptions=True,
         )
+
+        for name in failed:
+            ex = self._exchanges.pop(name, None)
+            if ex:
+                try:
+                    await ex.close()
+                except Exception:
+                    pass
+            log.info("[%s] removed from active exchanges", name)
+
+        if failed:
+            log.info(
+                "Removed %d failed exchanges, %d remaining",
+                len(failed), len(self._exchanges),
+            )
 
     def _discover_symbols(self) -> list[str]:
         if self._target_symbols:
@@ -184,36 +220,124 @@ class SpreadScanner:
     async def _fetch_tickers(
         self, exchange_id: str, exchange: ccxt.Exchange
     ) -> dict[str, dict]:
-        """Fetch all tickers from one exchange with retry."""
+        """Fetch all tickers from one exchange with retry. Track latency."""
+        if self._exchange_errors[exchange_id] >= MAX_EXCHANGE_ERRORS:
+            return {}
+
+        t0 = time.time()
         result = await _retry_async(
             lambda: exchange.fetch_tickers(),
             max_retries=self._max_retries,
             base_delay=self._base_delay,
         )
+        latency = time.time() - t0
+        self._exchange_fetch_latency[exchange_id] = latency
+
         if result is None:
+            self._exchange_errors[exchange_id] += 1
             return {}
+
+        self._exchange_errors[exchange_id] = 0
         return result
 
-    async def _scan_cycle(self, symbols: list[str]) -> list[Opportunity]:
-        """Run one full scan cycle across all exchanges."""
+    def _is_ticker_fresh(self, ticker: dict, now_ms: float) -> bool:
+        """Check if ticker timestamp is recent enough."""
+        ts = ticker.get("timestamp")
+        if ts is None:
+            return True
+        age_sec = (now_ms - ts) / 1000.0
+        if age_sec < 0:
+            age_sec = abs(age_sec)
+        return age_sec <= self._max_ticker_age
+
+    def _is_bid_ask_healthy(self, bid: float, ask: float) -> bool:
+        """Check if bid-ask spread is reasonable (not illiquid)."""
+        if bid <= 0 or ask <= 0:
+            return False
+        ba_spread_pct = (ask - bid) / bid * 100.0
+        return ba_spread_pct <= self._max_bid_ask_spread
+
+    async def _confirm_opportunity(self, opp: Opportunity) -> Opportunity | None:
+        """Re-fetch tickers for buy and sell exchanges to confirm spread."""
+        buy_ex = self._exchanges.get(opp.buy_exchange)
+        sell_ex = self._exchanges.get(opp.sell_exchange)
+        if not buy_ex or not sell_ex:
+            return None
+
+        try:
+            buy_ticker, sell_ticker = await asyncio.gather(
+                _retry_async(
+                    lambda be=buy_ex: be.fetch_ticker(opp.symbol),
+                    max_retries=1, base_delay=0.5,
+                ),
+                _retry_async(
+                    lambda se=sell_ex: se.fetch_ticker(opp.symbol),
+                    max_retries=1, base_delay=0.5,
+                ),
+            )
+        except Exception:
+            return None
+
+        if not buy_ticker or not sell_ticker:
+            return None
+
+        new_ask = buy_ticker.get("ask")
+        new_bid = sell_ticker.get("bid")
+        if not new_ask or not new_bid or new_ask <= 0 or new_bid <= 0:
+            return None
+
+        if not self._is_bid_ask_healthy(buy_ticker.get("bid", 0), new_ask):
+            return None
+        if not self._is_bid_ask_healthy(new_bid, sell_ticker.get("ask", 0)):
+            return None
+
+        buy_vol = buy_ticker.get("quoteVolume") or 0
+        sell_vol = sell_ticker.get("quoteVolume") or 0
+        if buy_vol <= 0:
+            buy_vol = (buy_ticker.get("baseVolume") or 0) * new_ask
+        if sell_vol <= 0:
+            sell_vol = (sell_ticker.get("baseVolume") or 0) * new_bid
+        min_vol = min(buy_vol, sell_vol)
+
+        confirmed = self._calculator.calculate(
+            symbol=opp.symbol,
+            buy_exchange=opp.buy_exchange,
+            sell_exchange=opp.sell_exchange,
+            buy_price=new_ask,
+            sell_price=new_bid,
+            volume_24h=min_vol,
+        )
+        if confirmed and confirmed.net_profit_pct >= self._confirm_min_spread:
+            return confirmed
+        return None
+
+    async def _scan_cycle(self, symbols: list[str]) -> tuple[list[Opportunity], dict]:
+        """Run one full scan cycle across all exchanges. Returns (opportunities, stats)."""
         sem = asyncio.Semaphore(self._max_concurrent)
+        now_ms = time.time() * 1000.0
+        stats = {
+            "stale_tickers": 0, "wide_bid_ask": 0,
+            "low_volume": 0, "confirmed": 0, "rejected_on_confirm": 0,
+        }
 
         async def _fetch_guarded(name: str, ex: ccxt.Exchange) -> tuple[str, dict]:
             async with sem:
                 tickers = await self._fetch_tickers(name, ex)
                 return name, tickers
 
+        active_exchanges = {
+            name: ex for name, ex in self._exchanges.items()
+            if self._exchange_errors[name] < MAX_EXCHANGE_ERRORS
+        }
         tasks = [
             _fetch_guarded(name, ex)
-            for name, ex in self._exchanges.items()
+            for name, ex in active_exchanges.items()
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         all_tickers: dict[str, dict[str, dict]] = {}
-        errors = 0
         for r in results:
             if isinstance(r, Exception):
-                errors += 1
                 continue
             name, tickers = r
             if tickers:
@@ -221,7 +345,7 @@ class SpreadScanner:
 
         if len(all_tickers) < 2:
             log.warning("Less than 2 exchanges returned data, skipping cycle")
-            return []
+            return [], stats
 
         opportunities: list[Opportunity] = []
 
@@ -232,9 +356,17 @@ class SpreadScanner:
                 if not ticker:
                     continue
 
+                if not self._is_ticker_fresh(ticker, now_ms):
+                    stats["stale_tickers"] += 1
+                    continue
+
                 bid = ticker.get("bid")
                 ask = ticker.get("ask")
                 if not bid or not ask or bid <= 0 or ask <= 0:
+                    continue
+
+                if not self._is_bid_ask_healthy(bid, ask):
+                    stats["wide_bid_ask"] += 1
                     continue
 
                 base_vol = ticker.get("baseVolume") or 0
@@ -243,6 +375,7 @@ class SpreadScanner:
                 vol_usd = quote_vol if quote_vol > 0 else (base_vol * last)
 
                 if vol_usd < self._min_volume:
+                    stats["low_volume"] += 1
                     continue
 
                 prices[ex_name] = {
@@ -266,7 +399,7 @@ class SpreadScanner:
                 opportunities.append(opp)
 
         opportunities.sort(key=lambda o: o.net_profit_pct, reverse=True)
-        return opportunities
+        return opportunities, stats
 
     async def run(self, stop_event: asyncio.Event | None = None) -> None:
         """Main scan loop."""
@@ -287,9 +420,11 @@ class SpreadScanner:
 
         log.info(
             "Spread scanner started: %d exchanges, %d symbols, "
-            "interval=%ds, min_spread=%.2f%%, min_volume=$%.0f",
+            "interval=%ds, min_spread=%.2f%%, min_volume=$%.0f, "
+            "max_ticker_age=%ds, max_bid_ask=%.1f%%, confirm_top=%d",
             len(self._exchanges), len(symbols),
             self._scan_interval, self._min_spread, self._min_volume,
+            self._max_ticker_age, self._max_bid_ask_spread, self._confirm_top_n,
         )
 
         cycle_count = 0
@@ -307,22 +442,60 @@ class SpreadScanner:
                 )
 
                 try:
-                    opportunities = await self._scan_cycle(symbols)
+                    opportunities, stats = await self._scan_cycle(symbols)
                 except Exception as e:
                     log.error("Scan cycle error: %s", e)
                     opportunities = []
+                    stats = {}
 
                 duration = time.time() - t0
 
                 if opportunities:
-                    log.info(
-                        "Found %d opportunities (cycle took %.1fs):",
-                        len(opportunities), duration,
-                    )
-                    for opp in opportunities[:10]:
-                        log.info("  %s", opp)
+                    top_to_confirm = opportunities[:self._confirm_top_n]
+                    confirmed: list[Opportunity] = []
 
-                    for opp in opportunities:
+                    if self._confirm_top_n > 0:
+                        confirm_tasks = [
+                            self._confirm_opportunity(opp)
+                            for opp in top_to_confirm
+                        ]
+                        confirm_results = await asyncio.gather(
+                            *confirm_tasks, return_exceptions=True
+                        )
+                        for r in confirm_results:
+                            if isinstance(r, Opportunity):
+                                confirmed.append(r)
+                        stats["confirmed"] = len(confirmed)
+                        stats["rejected_on_confirm"] = (
+                            len(top_to_confirm) - len(confirmed)
+                        )
+
+                    remaining = opportunities[self._confirm_top_n:]
+                    all_valid = confirmed + remaining
+
+                    filter_log = (
+                        f"stale={stats.get('stale_tickers', 0)} "
+                        f"wide_ba={stats.get('wide_bid_ask', 0)} "
+                        f"low_vol={stats.get('low_volume', 0)}"
+                    )
+                    confirm_log = ""
+                    if self._confirm_top_n > 0:
+                        confirm_log = (
+                            f" | confirmed={stats.get('confirmed', 0)}"
+                            f"/{len(top_to_confirm)}"
+                        )
+
+                    log.info(
+                        "Found %d raw, %d after validation "
+                        "(cycle %.1fs) [%s%s]:",
+                        len(opportunities), len(all_valid),
+                        duration, filter_log, confirm_log,
+                    )
+                    for opp in all_valid[:10]:
+                        tag = "[CONFIRMED]" if opp in confirmed else ""
+                        log.info("  %s %s", tag, opp)
+
+                    for opp in all_valid:
                         await self._db.log_opportunity(
                             symbol=opp.symbol,
                             buy_exchange=opp.buy_exchange,
@@ -341,6 +514,7 @@ class SpreadScanner:
                             direction=opp.direction,
                         )
 
+                    for opp in confirmed:
                         await self._notifier.alert_opportunity(
                             symbol=opp.symbol,
                             buy_exchange=opp.buy_exchange,
