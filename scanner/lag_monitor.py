@@ -20,6 +20,7 @@ from storage.db import ArbitrageDB
 log = logging.getLogger("arbitrage.lag_monitor")
 
 REFERENCE_WINDOW = 10  # seconds — window for detecting reference price movement
+MAX_LAG_DURATION = 120  # seconds — reset lag after this duration (stale state)
 
 
 @dataclass
@@ -37,6 +38,7 @@ class ExchangeState:
     lag_ref_price: float | None = None
     lag_direction: int | None = None  # +1 / -1
     last_alert_ts: float = 0.0
+    last_log_ts: float = 0.0  # separate throttle for console logs
     last_price: float | None = None
     consecutive_errors: int = 0
 
@@ -205,20 +207,24 @@ class LagMonitor:
                 continue
 
             if state.lag_start_ts is None:
-                state.lag_start_ts = now - REFERENCE_WINDOW / 2
+                state.lag_start_ts = now
                 state.lag_ref_price = old_ref_price
                 state.lag_direction = direction
+
+            lag_sec = now - state.lag_start_ts
+            if lag_sec > MAX_LAG_DURATION:
+                state.reset_lag()
+                continue
 
             ex_price = state.last_price
             ex_move_pct = (
                 (ex_price - state.lag_ref_price) / state.lag_ref_price * 100.0
             )
             caught_up = ex_move_pct * state.lag_direction > self._price_move_pct * 0.5
-            lag_sec = now - state.lag_start_ts
             dir_str = "UP" if state.lag_direction == 1 else "DOWN"
 
             if caught_up:
-                if lag_sec >= self._lag_threshold and (now - state.last_alert_ts) > 5.0:
+                if lag_sec >= self._lag_threshold and (now - state.last_alert_ts) > 10.0:
                     log.warning(
                         "LAG DETECTED  %-20s %-16s %s  ref_move=%+.3f%%  "
                         "ex_move=%+.3f%%  lag=%.2fs",
@@ -247,15 +253,15 @@ class LagMonitor:
             else:
                 if (
                     lag_sec >= self._lag_threshold
-                    and (now - state.last_alert_ts) > self._lag_threshold
+                    and (now - state.last_log_ts) > 30.0
                 ):
-                    log.warning(
+                    log.info(
                         "LAGGING NOW   %-20s %-16s %s  ref=%.6g  ex=%.6g  "
                         "ref_move=%+.3f%%  lag=%.2fs (ongoing)",
                         name, symbol, dir_str,
                         ref_price, ex_price, pct_move, lag_sec,
                     )
-                    state.last_alert_ts = now
+                    state.last_log_ts = now
 
     async def _fetch_loop(
         self,
@@ -330,7 +336,7 @@ class LagMonitor:
         async def detection_loop() -> None:
             while not stop_event.is_set():
                 await self._detect_lags(ref_states, lag_states, symbol)
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(1.0)
 
         async def status_loop() -> None:
             while not stop_event.is_set():

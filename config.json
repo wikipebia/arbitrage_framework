@@ -152,10 +152,10 @@
   "lag_monitor": {
     "enabled": true,
     "reference_exchanges": ["binance", "okx", "bybit", "coinbase", "kucoin"],
-    "lag_threshold_sec": 1.0,
-    "price_move_pct": 0.05,
-    "fetch_interval_sec": 0.5,
-    "max_symbols": 50
+    "lag_threshold_sec": 3.0,
+    "price_move_pct": 0.15,
+    "fetch_interval_sec": 1.0,
+    "max_symbols": 30
   },
 
   "telegram": {
@@ -163,7 +163,7 @@
     "bot_token": "",
     "chat_id": "",
     "min_profit_pct_alert": 0.5,
-    "alert_cooldown_sec": 60
+    "alert_cooldown_sec": 30
   },
 
   "database": {

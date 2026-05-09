@@ -108,6 +108,7 @@ class TelegramNotifier:
 
         alert_key = f"{symbol}:{buy_exchange}:{sell_exchange}"
         if not self._should_alert(alert_key):
+            log.debug("Cooldown active for %s", alert_key)
             return
 
         vol_str = f"${volume_24h:,.0f}" if volume_24h else "N/A"
@@ -123,7 +124,11 @@ class TelegramNotifier:
             f"Est. profit: <b>${estimated_profit_usd:.2f}</b>\n"
             f"Volume 24h: {vol_str}\n"
         )
-        await self.send_message(text)
+        ok = await self.send_message(text)
+        if ok:
+            log.info("TG alert sent: %s %s -> %s  NET %.3f%%", symbol, buy_exchange, sell_exchange, net_profit_pct)
+        else:
+            log.warning("TG alert FAILED: %s", symbol)
 
     async def alert_lag(
         self,
@@ -141,6 +146,8 @@ class TelegramNotifier:
         alert_key = f"lag:{symbol}:{exchange}"
         if not self._should_alert(alert_key):
             return
+
+        log.info("TG lag alert: %s on %s  lag=%.2fs", symbol, exchange, lag_seconds)
 
         text = (
             f"<b>LAG DETECTED {direction}</b>\n"
