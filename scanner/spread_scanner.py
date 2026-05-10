@@ -153,6 +153,7 @@ class SpreadScanner:
         self._auto_blacklist: set[str] = set()
         self._anomaly_streak: dict[str, int] = defaultdict(int)
         self._deposit_withdraw_cache: dict[str, dict[str, bool]] = {}
+        self._contract_addresses: dict[str, dict[str, str]] = {}
 
     async def _init_exchanges(self) -> None:
         for cfg in self._exchange_configs:
@@ -261,12 +262,24 @@ class SpreadScanner:
                     if not currencies:
                         return
                     status: dict[str, bool] = {}
+                    contracts: dict[str, str] = {}
                     for code, info in currencies.items():
                         deposit_ok = info.get('deposit', True)
                         withdraw_ok = info.get('withdraw', True)
                         active = info.get('active', True)
                         status[code] = bool(deposit_ok and withdraw_ok and active)
+                        networks = info.get('networks') or {}
+                        for net_name, net_info in networks.items():
+                            addr = (
+                                net_info.get('contractAddress')
+                                or net_info.get('contract')
+                                or net_info.get('address')
+                            )
+                            if addr and code not in contracts:
+                                contracts[code] = addr
                     self._deposit_withdraw_cache[name] = status
+                    if contracts:
+                        self._contract_addresses[name] = contracts
                     log.info(
                         "[%s] loaded deposit/withdraw status for %d currencies",
                         name, len(status),
@@ -282,6 +295,14 @@ class SpreadScanner:
             "Deposit/withdraw status loaded for %d/%d exchanges",
             len(self._deposit_withdraw_cache), len(self._exchanges),
         )
+
+    def _get_contract_address(self, base_currency: str) -> str:
+        """Look up smart contract address for a currency across all exchanges."""
+        for ex_name, contracts in self._contract_addresses.items():
+            addr = contracts.get(base_currency)
+            if addr:
+                return addr
+        return ""
 
     def _is_transfer_ok(self, symbol: str, buy_exchange: str, sell_exchange: str) -> bool:
         """Check if deposit on sell_exchange and withdrawal on buy_exchange are enabled."""
@@ -656,6 +677,8 @@ class SpreadScanner:
                         )
 
                     for opp in confirmed:
+                        base = opp.symbol.split('/')[0] if '/' in opp.symbol else opp.symbol
+                        contract = self._get_contract_address(base)
                         await self._notifier.alert_opportunity(
                             symbol=opp.symbol,
                             buy_exchange=opp.buy_exchange,
@@ -667,6 +690,7 @@ class SpreadScanner:
                             volume_24h=opp.volume_24h,
                             estimated_profit_usd=opp.estimated_profit_usd,
                             direction=opp.direction,
+                            contract_address=contract,
                         )
                 else:
                     log.info(

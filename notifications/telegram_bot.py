@@ -124,6 +124,7 @@ class TelegramNotifier:
         volume_24h: float = 0.0,
         estimated_profit_usd: float = 0.0,
         direction: str = "",
+        contract_address: str = "",
     ) -> None:
         if not self._enabled:
             return
@@ -150,6 +151,8 @@ class TelegramNotifier:
             f"Est. profit: <b>${estimated_profit_usd:.2f}</b>\n"
             f"Volume 24h: {vol_str}\n"
         )
+        if contract_address:
+            text += f"\nContract: <code>{contract_address}</code>\n"
         ok = await self.send_message(text)
         if ok:
             self._cycle_alert_count += 1

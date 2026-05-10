@@ -319,24 +319,26 @@ class LagMonitor:
                     state.consecutive_errors = 0
             except (ccxt.NetworkError, ccxt.ExchangeError) as e:
                 state.consecutive_errors += 1
+                err_msg = str(e)[:200]
                 if state.consecutive_errors >= MAX_EXCHANGE_ERRORS and not state.dead:
                     state.dead = True
                     log.warning(
                         "[%s/%s] marked DEAD after %d errors: %s",
-                        state.name, symbol, state.consecutive_errors, e,
+                        state.name, symbol, state.consecutive_errors, err_msg,
                     )
                 elif state.consecutive_errors <= 3:
-                    log.debug("[%s/%s] %s: %s", state.name, symbol, type(e).__name__, e)
+                    log.debug("[%s/%s] %s: %s", state.name, symbol, type(e).__name__, err_msg)
             except Exception as e:
                 state.consecutive_errors += 1
+                err_msg = str(e)[:200]
                 if state.consecutive_errors >= MAX_EXCHANGE_ERRORS and not state.dead:
                     state.dead = True
                     log.warning(
                         "[%s/%s] marked DEAD after %d errors: %s",
-                        state.name, symbol, state.consecutive_errors, e,
+                        state.name, symbol, state.consecutive_errors, err_msg,
                     )
                 elif state.consecutive_errors <= 3:
-                    log.debug("[%s/%s] Error: %s", state.name, symbol, e)
+                    log.debug("[%s/%s] Error: %s", state.name, symbol, err_msg)
 
             elapsed = time.monotonic() - t0
             wait = max(0.0, self._fetch_interval - elapsed)
