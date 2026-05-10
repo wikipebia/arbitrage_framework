@@ -146,6 +146,10 @@ async def run(config: dict, scanner_only: bool, lag_only: bool) -> None:
                 fetch_interval=lag_cfg.get("fetch_interval_sec", 0.5),
                 quote_currencies=scanner_cfg.get("quote_currencies", ["USDT", "USDC"]),
                 max_symbols=lag_cfg.get("max_symbols", 50),
+                min_volume_24h=lag_cfg.get(
+                    "min_volume_24h_usd",
+                    scanner_cfg.get("min_volume_24h_usd", 50000),
+                ),
             )
             tasks.append(
                 asyncio.create_task(lag_monitor.run(stop_event), name="lag_monitor")

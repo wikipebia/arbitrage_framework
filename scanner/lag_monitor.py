@@ -101,6 +101,7 @@ class LagMonitor:
         quote_currencies: list[str] | None = None,
         max_symbols: int = 0,
         explicit_symbols: list[str] | None = None,
+        min_volume_24h: float = 50000.0,
     ):
         self._exchange_names = exchange_names
         self._reference_names = reference_exchanges
@@ -112,6 +113,7 @@ class LagMonitor:
         self._quote_currencies = quote_currencies or ["USDT", "USDC", "USD"]
         self._max_symbols = max_symbols
         self._explicit_symbols = explicit_symbols
+        self._min_volume = min_volume_24h
         self._exchanges: dict[str, ccxt.Exchange] = {}
 
     async def _init_exchanges(self) -> None:
@@ -167,8 +169,50 @@ class LagMonitor:
         if self._max_symbols > 0:
             filtered = filtered[: self._max_symbols]
 
-        log.info("Discovered %d symbols for lag monitoring", len(filtered))
+        log.info("Discovered %d candidate symbols for lag monitoring", len(filtered))
         return filtered
+
+    async def _filter_by_volume(self, symbols: list[str]) -> list[str]:
+        """Pre-filter symbols by 24h volume on reference exchanges."""
+        if self._min_volume <= 0:
+            return symbols
+
+        ref_ex = next(
+            (self._exchanges[n] for n in self._reference_names if n in self._exchanges),
+            None,
+        )
+        if ref_ex is None:
+            log.warning("No reference exchange available for volume filter")
+            return symbols
+
+        ref_name = next(n for n in self._reference_names if n in self._exchanges)
+        try:
+            tickers = await asyncio.wait_for(ref_ex.fetch_tickers(), timeout=30)
+        except Exception as e:
+            log.warning("[%s] fetch_tickers for volume filter failed: %s", ref_name, e)
+            return symbols
+
+        passed: list[str] = []
+        skipped = 0
+        for sym in symbols:
+            ticker = tickers.get(sym)
+            if not ticker:
+                skipped += 1
+                continue
+            quote_vol = ticker.get("quoteVolume") or 0
+            base_vol = ticker.get("baseVolume") or 0
+            last = ticker.get("last") or 0
+            vol_usd = quote_vol if quote_vol > 0 else (base_vol * last if last else 0)
+            if vol_usd >= self._min_volume:
+                passed.append(sym)
+            else:
+                skipped += 1
+
+        log.info(
+            "Volume filter: %d passed (>=$%.0f), %d skipped",
+            len(passed), self._min_volume, skipped,
+        )
+        return passed
 
     @staticmethod
     def _get_reference_price(ref_states: dict[str, ExchangeState]) -> float | None:
@@ -421,6 +465,12 @@ class LagMonitor:
         symbols = await self._discover_symbols()
         if not symbols:
             log.error("No symbols found for lag monitoring")
+            await self._close_exchanges()
+            return
+
+        symbols = await self._filter_by_volume(symbols)
+        if not symbols:
+            log.error("No symbols passed volume filter for lag monitoring")
             await self._close_exchanges()
             return
 

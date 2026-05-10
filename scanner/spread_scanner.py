@@ -439,6 +439,9 @@ class SpreadScanner:
             sell_vol = (sell_ticker.get("baseVolume") or 0) * new_bid
         min_vol = min(buy_vol, sell_vol)
 
+        if min_vol < self._min_volume:
+            return None
+
         confirmed = self._calculator.calculate(
             symbol=opp.symbol,
             buy_exchange=opp.buy_exchange,

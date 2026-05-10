@@ -162,7 +162,8 @@
     "lag_threshold_sec": 3.0,
     "price_move_pct": 0.15,
     "fetch_interval_sec": 1.0,
-    "max_symbols": 30
+    "max_symbols": 30,
+    "min_volume_24h_usd": 50000
   },
 
   "telegram": {
