@@ -29,10 +29,38 @@ log = logging.getLogger("arbitrage.scanner")
 MAX_EXCHANGE_ERRORS = 10
 AUTO_BLACKLIST_THRESHOLD = 3  # auto-blacklist after N consecutive anomalous cycles
 ANOMALOUS_SPREAD_PCT = 30.0  # spreads above this are considered anomalous
+PERSISTENT_SPREAD_CYCLES = 5  # skip opportunity after N consecutive confirmed cycles
 
 LEVERAGED_TOKEN_RE = re.compile(
     r"\d+[SLsl]/|UP/|DOWN/|BULL/|BEAR/|HALF/|EDGE/"
 )
+
+_NETWORK_ALIASES: dict[str, str] = {
+    "erc20": "eth", "eth": "eth", "ethereum": "eth",
+    "trc20": "trx", "trx": "trx", "tron": "trx",
+    "bep20": "bsc", "bsc": "bsc", "binancesmartchain": "bsc",
+    "bep2": "bep2", "bnb": "bep2",
+    "spl": "sol", "sol": "sol", "solana": "sol",
+    "polygon": "polygon", "matic": "polygon",
+    "arbitrum": "arbitrum", "arb": "arbitrum", "arbitrumone": "arbitrum",
+    "optimism": "optimism", "op": "optimism",
+    "avaxc": "avax", "avax": "avax", "avalanche": "avax", "cchain": "avax",
+    "base": "base",
+    "ton": "ton", "toncoin": "ton",
+    "chz2": "chz2", "cap20": "chz2", "chiliz": "chz2", "chiliz2": "chz2",
+    "chz": "chz",
+    "cosmos": "atom", "atom": "atom",
+    "algo": "algo", "algorand": "algo",
+    "near": "near",
+    "ftm": "ftm", "fantom": "ftm",
+    "heco": "heco", "ht": "heco",
+}
+
+
+def _normalize_network(name: str) -> str:
+    """Normalize network name for cross-exchange comparison."""
+    key = name.lower().replace("-", "").replace("_", "").replace(" ", "")
+    return _NETWORK_ALIASES.get(key, key)
 
 
 def _build_exchange(
@@ -153,7 +181,9 @@ class SpreadScanner:
         self._auto_blacklist: set[str] = set()
         self._anomaly_streak: dict[str, int] = defaultdict(int)
         self._deposit_withdraw_cache: dict[str, dict[str, bool]] = {}
+        self._network_status: dict[str, dict[str, dict[str, dict[str, bool]]]] = {}
         self._contract_addresses: dict[str, dict[str, str]] = {}
+        self._persistent_spread: dict[str, int] = defaultdict(int)
 
     async def _init_exchanges(self) -> None:
         for cfg in self._exchange_configs:
@@ -220,6 +250,41 @@ class SpreadScanner:
             return True
         return False
 
+    def _update_persistent_spreads(self, confirmed: list[Opportunity]) -> None:
+        """Track confirmed opportunities that persist across cycles.
+
+        Real arbitrage closes within seconds. If the same symbol+direction
+        is confirmed for PERSISTENT_SPREAD_CYCLES in a row the spread is
+        structural (different networks, suspended transfers missed by the
+        currency-level check, etc.) and should be skipped — but NOT
+        permanently blacklisted so that legitimate future opportunities
+        on the same symbol still pass.
+        """
+        confirmed_keys: set[str] = set()
+        for opp in confirmed:
+            key = f"{opp.symbol}|{opp.buy_exchange}->{opp.sell_exchange}"
+            confirmed_keys.add(key)
+
+        all_keys = set(self._persistent_spread.keys()) | confirmed_keys
+        for key in all_keys:
+            if key in confirmed_keys:
+                self._persistent_spread[key] += 1
+                if self._persistent_spread[key] == PERSISTENT_SPREAD_CYCLES:
+                    sym = key.split("|")[0]
+                    route = key.split("|")[1]
+                    log.warning(
+                        "Persistent spread detected: %s (%s) — "
+                        "confirmed %d consecutive cycles, skipping until spread changes",
+                        sym, route, PERSISTENT_SPREAD_CYCLES,
+                    )
+            else:
+                self._persistent_spread.pop(key, None)
+
+    def _is_persistent_spread(self, opp: Opportunity) -> bool:
+        """Check if this opportunity has been persistent (likely unexecutable)."""
+        key = f"{opp.symbol}|{opp.buy_exchange}->{opp.sell_exchange}"
+        return self._persistent_spread.get(key, 0) >= PERSISTENT_SPREAD_CYCLES
+
     def _update_auto_blacklist(self, opportunities: list[Opportunity]) -> int:
         """Track symbols with anomalous spreads; auto-blacklist persistent ones."""
         seen_anomalous: set[str] = set()
@@ -245,7 +310,12 @@ class SpreadScanner:
         return newly_blacklisted
 
     async def _load_deposit_withdraw_status(self) -> None:
-        """Fetch deposit/withdraw status from exchanges that support it."""
+        """Fetch deposit/withdraw status from exchanges that support it.
+
+        Stores both currency-level status and per-network status so that
+        _is_transfer_ok can verify a common active network exists between
+        the buy and sell exchanges.
+        """
         if not self._check_deposit_withdraw:
             return
 
@@ -263,21 +333,31 @@ class SpreadScanner:
                         return
                     status: dict[str, bool] = {}
                     contracts: dict[str, str] = {}
+                    net_status: dict[str, dict[str, dict[str, bool]]] = {}
                     for code, info in currencies.items():
                         deposit_ok = info.get('deposit', True)
                         withdraw_ok = info.get('withdraw', True)
                         active = info.get('active', True)
                         status[code] = bool(deposit_ok and withdraw_ok and active)
                         networks = info.get('networks') or {}
-                        for net_name, net_info in networks.items():
-                            addr = (
-                                net_info.get('contractAddress')
-                                or net_info.get('contract')
-                                or net_info.get('address')
-                            )
-                            if addr and code not in contracts:
-                                contracts[code] = addr
+                        if networks:
+                            code_nets: dict[str, dict[str, bool]] = {}
+                            for net_name, net_info in networks.items():
+                                norm = _normalize_network(net_name)
+                                code_nets[norm] = {
+                                    "deposit": bool(net_info.get('deposit', True) and net_info.get('active', True)),
+                                    "withdraw": bool(net_info.get('withdraw', True) and net_info.get('active', True)),
+                                }
+                                addr = (
+                                    net_info.get('contractAddress')
+                                    or net_info.get('contract')
+                                    or net_info.get('address')
+                                )
+                                if addr and code not in contracts:
+                                    contracts[code] = addr
+                            net_status[code] = code_nets
                     self._deposit_withdraw_cache[name] = status
+                    self._network_status[name] = net_status
                     if contracts:
                         self._contract_addresses[name] = contracts
                     log.info(
@@ -305,10 +385,30 @@ class SpreadScanner:
         return ""
 
     def _is_transfer_ok(self, symbol: str, buy_exchange: str, sell_exchange: str) -> bool:
-        """Check if deposit on sell_exchange and withdrawal on buy_exchange are enabled."""
+        """Check if a transfer path exists between buy and sell exchanges.
+
+        For arbitrage to work we need to withdraw from buy_exchange and
+        deposit to sell_exchange on a *common* network.  If per-network
+        data is available for both sides we require at least one network
+        where withdraw is enabled on buy_exchange AND deposit is enabled
+        on sell_exchange.  Falls back to currency-level check when network
+        data is missing.
+        """
         if not self._check_deposit_withdraw:
             return True
         base = symbol.split("/")[0] if "/" in symbol else symbol
+
+        buy_nets = (self._network_status.get(buy_exchange) or {}).get(base)
+        sell_nets = (self._network_status.get(sell_exchange) or {}).get(base)
+
+        if buy_nets and sell_nets:
+            for net, buy_info in buy_nets.items():
+                if not buy_info.get("withdraw", False):
+                    continue
+                sell_info = sell_nets.get(net)
+                if sell_info and sell_info.get("deposit", False):
+                    return True
+            return False
 
         buy_status = self._deposit_withdraw_cache.get(buy_exchange)
         if buy_status is not None:
@@ -637,6 +737,8 @@ class SpreadScanner:
                             s for s in symbols if not self._is_blacklisted(s)
                         ]
 
+                    self._update_persistent_spreads(confirmed)
+
                     filter_log = (
                         f"stale={stats.get('stale_tickers', 0)} "
                         f"wide_ba={stats.get('wide_bid_ask', 0)} "
@@ -680,6 +782,8 @@ class SpreadScanner:
                         )
 
                     for opp in confirmed:
+                        if self._is_persistent_spread(opp):
+                            continue
                         base = opp.symbol.split('/')[0] if '/' in opp.symbol else opp.symbol
                         contract = self._get_contract_address(base)
                         await self._notifier.alert_opportunity(
