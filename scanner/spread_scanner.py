@@ -1,5 +1,4 @@
-"""
-Multi-exchange spread scanner with signal validation.
+"""Multi-exchange spread scanner with signal validation.
 
 Merged from zapozdavwie.py (CEX-CEX spread monitoring) and scanner.py (CEX-DEX).
 Async architecture with ccxt.async_support, rate-limit awareness, retry logic.
@@ -9,10 +8,13 @@ Signal validation:
   - Re-confirmation: re-fetch top opportunities to confirm spread still exists
   - Bid-ask spread check: wide bid-ask = illiquid, unreliable
   - Dead exchange detection: skip exchanges with consecutive failures
+  - Symbol blacklist: static (config) + auto-blacklist for persistent anomalies
+  - Deposit/withdrawal status: skip pairs where transfers are suspended
 """
 
 import asyncio
 import logging
+import re
 import time
 from collections import defaultdict
 
@@ -25,6 +27,12 @@ from storage.db import ArbitrageDB
 log = logging.getLogger("arbitrage.scanner")
 
 MAX_EXCHANGE_ERRORS = 10
+AUTO_BLACKLIST_THRESHOLD = 3  # auto-blacklist after N consecutive anomalous cycles
+ANOMALOUS_SPREAD_PCT = 30.0  # spreads above this are considered anomalous
+
+LEVERAGED_TOKEN_RE = re.compile(
+    r"\d+[SLsl]/|UP/|DOWN/|BULL/|BEAR/|HALF/|EDGE/"
+)
 
 
 def _build_exchange(
@@ -114,6 +122,9 @@ class SpreadScanner:
         max_bid_ask_spread_pct: float = 3.0,
         confirm_top_n: int = 5,
         confirm_min_spread_pct: float = 0.5,
+        symbol_blacklist: list[str] | None = None,
+        filter_leveraged_tokens: bool = True,
+        check_deposit_withdraw: bool = True,
     ):
         self._exchange_configs = exchange_configs
         self._calculator = calculator
@@ -132,10 +143,16 @@ class SpreadScanner:
         self._max_bid_ask_spread = max_bid_ask_spread_pct
         self._confirm_top_n = confirm_top_n
         self._confirm_min_spread = confirm_min_spread_pct
+        self._filter_leveraged = filter_leveraged_tokens
+        self._check_deposit_withdraw = check_deposit_withdraw
         self._exchanges: dict[str, ccxt.Exchange] = {}
         self._exchange_errors: dict[str, int] = defaultdict(int)
         self._exchange_fetch_latency: dict[str, float] = {}
         self._running = False
+        self._static_blacklist: set[str] = set(symbol_blacklist or [])
+        self._auto_blacklist: set[str] = set()
+        self._anomaly_streak: dict[str, int] = defaultdict(int)
+        self._deposit_withdraw_cache: dict[str, dict[str, bool]] = {}
 
     async def _init_exchanges(self) -> None:
         for cfg in self._exchange_configs:
@@ -194,9 +211,101 @@ class SpreadScanner:
                 len(failed), len(self._exchanges),
             )
 
+    def _is_blacklisted(self, symbol: str) -> bool:
+        """Check static + auto blacklist + leveraged token filter."""
+        if symbol in self._static_blacklist or symbol in self._auto_blacklist:
+            return True
+        if self._filter_leveraged and LEVERAGED_TOKEN_RE.search(symbol):
+            return True
+        return False
+
+    def _update_auto_blacklist(self, opportunities: list[Opportunity]) -> int:
+        """Track symbols with anomalous spreads; auto-blacklist persistent ones."""
+        seen_anomalous: set[str] = set()
+        for opp in opportunities:
+            if opp.gross_spread_pct > ANOMALOUS_SPREAD_PCT:
+                seen_anomalous.add(opp.symbol)
+
+        newly_blacklisted = 0
+        all_symbols = set(self._anomaly_streak.keys()) | seen_anomalous
+        for sym in all_symbols:
+            if sym in seen_anomalous:
+                self._anomaly_streak[sym] += 1
+                if self._anomaly_streak[sym] >= AUTO_BLACKLIST_THRESHOLD:
+                    if sym not in self._auto_blacklist:
+                        self._auto_blacklist.add(sym)
+                        newly_blacklisted += 1
+                        log.warning(
+                            "Auto-blacklisted %s (anomalous %d cycles)",
+                            sym, self._anomaly_streak[sym],
+                        )
+            else:
+                self._anomaly_streak[sym] = 0
+        return newly_blacklisted
+
+    async def _load_deposit_withdraw_status(self) -> None:
+        """Fetch deposit/withdraw status from exchanges that support it."""
+        if not self._check_deposit_withdraw:
+            return
+
+        sem = asyncio.Semaphore(3)
+
+        async def _fetch_currencies(name: str, ex: ccxt.Exchange) -> None:
+            async with sem:
+                try:
+                    if not hasattr(ex, 'fetch_currencies') or not ex.has.get('fetchCurrencies'):
+                        return
+                    currencies = await asyncio.wait_for(
+                        ex.fetch_currencies(), timeout=15,
+                    )
+                    if not currencies:
+                        return
+                    status: dict[str, bool] = {}
+                    for code, info in currencies.items():
+                        deposit_ok = info.get('deposit', True)
+                        withdraw_ok = info.get('withdraw', True)
+                        active = info.get('active', True)
+                        status[code] = bool(deposit_ok and withdraw_ok and active)
+                    self._deposit_withdraw_cache[name] = status
+                    log.info(
+                        "[%s] loaded deposit/withdraw status for %d currencies",
+                        name, len(status),
+                    )
+                except Exception as e:
+                    log.debug("[%s] fetch_currencies failed: %s", name, e)
+
+        await asyncio.gather(
+            *[_fetch_currencies(n, e) for n, e in self._exchanges.items()],
+            return_exceptions=True,
+        )
+        log.info(
+            "Deposit/withdraw status loaded for %d/%d exchanges",
+            len(self._deposit_withdraw_cache), len(self._exchanges),
+        )
+
+    def _is_transfer_ok(self, symbol: str, buy_exchange: str, sell_exchange: str) -> bool:
+        """Check if deposit on sell_exchange and withdrawal on buy_exchange are enabled."""
+        if not self._check_deposit_withdraw:
+            return True
+        base = symbol.split("/")[0] if "/" in symbol else symbol
+
+        buy_status = self._deposit_withdraw_cache.get(buy_exchange)
+        if buy_status is not None:
+            if not buy_status.get(base, True):
+                return False
+
+        sell_status = self._deposit_withdraw_cache.get(sell_exchange)
+        if sell_status is not None:
+            if not sell_status.get(base, True):
+                return False
+        return True
+
     def _discover_symbols(self) -> list[str]:
         if self._target_symbols:
-            return self._target_symbols
+            return [
+                s for s in self._target_symbols
+                if not self._is_blacklisted(s)
+            ]
 
         symbol_exchanges: dict[str, set[str]] = defaultdict(set)
 
@@ -208,13 +317,23 @@ class SpreadScanner:
                 if quote in self._quote_currencies:
                     symbol_exchanges[sym].add(name)
 
-        symbols = [
-            sym
-            for sym, exs in symbol_exchanges.items()
-            if len(exs) >= 2
-        ]
+        blacklisted_count = 0
+        symbols = []
+        for sym, exs in symbol_exchanges.items():
+            if len(exs) < 2:
+                continue
+            if self._is_blacklisted(sym):
+                blacklisted_count += 1
+                continue
+            symbols.append(sym)
+
         symbols.sort()
-        log.info("Discovered %d symbols tradeable on 2+ exchanges", len(symbols))
+        log.info(
+            "Discovered %d symbols tradeable on 2+ exchanges "
+            "(%d blacklisted, %d leveraged filtered)",
+            len(symbols), blacklisted_count,
+            blacklisted_count,
+        )
         return symbols
 
     async def _fetch_tickers(
@@ -318,6 +437,7 @@ class SpreadScanner:
         stats = {
             "stale_tickers": 0, "wide_bid_ask": 0,
             "low_volume": 0, "confirmed": 0, "rejected_on_confirm": 0,
+            "blacklisted": 0, "transfer_blocked": 0,
         }
 
         async def _fetch_guarded(name: str, ex: ccxt.Exchange) -> tuple[str, dict]:
@@ -350,6 +470,10 @@ class SpreadScanner:
         opportunities: list[Opportunity] = []
 
         for symbol in symbols:
+            if self._is_blacklisted(symbol):
+                stats["blacklisted"] += 1
+                continue
+
             prices: dict[str, dict] = {}
             for ex_name, tickers in all_tickers.items():
                 ticker = tickers.get(symbol)
@@ -396,6 +520,11 @@ class SpreadScanner:
             for opp in opps:
                 if opp.gross_spread_pct > self._max_spread:
                     continue
+                if not self._is_transfer_ok(
+                    opp.symbol, opp.buy_exchange, opp.sell_exchange,
+                ):
+                    stats["transfer_blocked"] += 1
+                    continue
                 opportunities.append(opp)
 
         opportunities.sort(key=lambda o: o.net_profit_pct, reverse=True)
@@ -411,6 +540,7 @@ class SpreadScanner:
             return
 
         await self._load_markets()
+        await self._load_deposit_withdraw_status()
 
         symbols = self._discover_symbols()
         if not symbols:
@@ -418,13 +548,16 @@ class SpreadScanner:
             await self._close_exchanges()
             return
 
+        bl_count = len(self._static_blacklist) + len(self._auto_blacklist)
         log.info(
             "Spread scanner started: %d exchanges, %d symbols, "
             "interval=%ds, min_spread=%.2f%%, min_volume=$%.0f, "
-            "max_ticker_age=%ds, max_bid_ask=%.1f%%, confirm_top=%d",
+            "max_ticker_age=%ds, max_bid_ask=%.1f%%, confirm_top=%d, "
+            "blacklisted=%d, deposit_withdraw_check=%s",
             len(self._exchanges), len(symbols),
             self._scan_interval, self._min_spread, self._min_volume,
             self._max_ticker_age, self._max_bid_ask_spread, self._confirm_top_n,
+            bl_count, self._check_deposit_withdraw,
         )
 
         cycle_count = 0
@@ -435,6 +568,7 @@ class SpreadScanner:
 
                 cycle_count += 1
                 t0 = time.time()
+                self._notifier.reset_cycle_counter()
                 log.info(
                     "--- Scan cycle #%d | %s ---",
                     cycle_count,
@@ -473,10 +607,17 @@ class SpreadScanner:
                     remaining = opportunities[self._confirm_top_n:]
                     all_valid = confirmed + remaining
 
+                    new_bl = self._update_auto_blacklist(opportunities)
+                    if new_bl:
+                        symbols = [
+                            s for s in symbols if not self._is_blacklisted(s)
+                        ]
+
                     filter_log = (
                         f"stale={stats.get('stale_tickers', 0)} "
                         f"wide_ba={stats.get('wide_bid_ask', 0)} "
-                        f"low_vol={stats.get('low_volume', 0)}"
+                        f"low_vol={stats.get('low_volume', 0)} "
+                        f"xfer_blocked={stats.get('transfer_blocked', 0)}"
                     )
                     confirm_log = ""
                     if self._confirm_top_n > 0:

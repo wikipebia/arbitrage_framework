@@ -67,6 +67,7 @@ async def run(config: dict, scanner_only: bool, lag_only: bool) -> None:
         min_profit_pct=tg_cfg.get("min_profit_pct_alert", 0.5),
         cooldown_sec=tg_cfg.get("alert_cooldown_sec", 60),
         enabled=tg_cfg.get("enabled", False),
+        max_alerts_per_cycle=tg_cfg.get("max_alerts_per_cycle", 10),
     )
     await notifier.start()
 
@@ -112,6 +113,9 @@ async def run(config: dict, scanner_only: bool, lag_only: bool) -> None:
             max_bid_ask_spread_pct=scanner_cfg.get("max_bid_ask_spread_pct", 3.0),
             confirm_top_n=scanner_cfg.get("confirm_top_n", 5),
             confirm_min_spread_pct=scanner_cfg.get("confirm_min_spread_pct", 0.5),
+            symbol_blacklist=scanner_cfg.get("symbol_blacklist"),
+            filter_leveraged_tokens=scanner_cfg.get("filter_leveraged_tokens", True),
+            check_deposit_withdraw=scanner_cfg.get("check_deposit_withdraw", True),
         )
 
         exchange_names = [e["id"] for e in enabled_exchanges]

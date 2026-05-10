@@ -12,6 +12,9 @@ import aiohttp
 log = logging.getLogger("arbitrage.telegram")
 
 
+MAX_TG_PER_SECOND = 20  # Telegram allows ~30/sec, keep margin
+
+
 class TelegramNotifier:
     API_BASE = "https://api.telegram.org/bot{token}"
 
@@ -22,6 +25,7 @@ class TelegramNotifier:
         min_profit_pct: float = 0.5,
         cooldown_sec: float = 60.0,
         enabled: bool = True,
+        max_alerts_per_cycle: int = 10,
     ):
         self._token = bot_token
         self._chat_id = chat_id
@@ -30,6 +34,9 @@ class TelegramNotifier:
         self._enabled = enabled and bool(bot_token) and bool(chat_id)
         self._last_alerts: dict[str, float] = {}
         self._session: aiohttp.ClientSession | None = None
+        self._max_alerts_per_cycle = max_alerts_per_cycle
+        self._cycle_alert_count = 0
+        self._send_timestamps: list[float] = []
 
     async def start(self) -> None:
         if not self._enabled:
@@ -74,9 +81,25 @@ class TelegramNotifier:
         self._last_alerts[key] = now
         return True
 
+    def reset_cycle_counter(self) -> None:
+        """Reset per-cycle alert counter. Call at start of each scan cycle."""
+        self._cycle_alert_count = 0
+
+    async def _rate_limit_wait(self) -> None:
+        """Wait if needed to respect Telegram rate limits."""
+        now = time.time()
+        self._send_timestamps = [
+            ts for ts in self._send_timestamps if now - ts < 1.0
+        ]
+        if len(self._send_timestamps) >= MAX_TG_PER_SECOND:
+            wait = 1.0 - (now - self._send_timestamps[0])
+            if wait > 0:
+                await asyncio.sleep(wait)
+
     async def send_message(self, text: str) -> bool:
         if not self._enabled:
             return False
+        await self._rate_limit_wait()
         result = await self._api_call(
             "sendMessage",
             {
@@ -86,6 +109,7 @@ class TelegramNotifier:
                 "disable_web_page_preview": True,
             },
         )
+        self._send_timestamps.append(time.time())
         return bool(result and result.get("ok"))
 
     async def alert_opportunity(
@@ -104,6 +128,8 @@ class TelegramNotifier:
         if not self._enabled:
             return
         if net_profit_pct < self._min_profit:
+            return
+        if self._cycle_alert_count >= self._max_alerts_per_cycle:
             return
 
         alert_key = f"{symbol}:{buy_exchange}:{sell_exchange}"
@@ -126,6 +152,7 @@ class TelegramNotifier:
         )
         ok = await self.send_message(text)
         if ok:
+            self._cycle_alert_count += 1
             log.info("TG alert sent: %s %s -> %s  NET %.3f%%", symbol, buy_exchange, sell_exchange, net_profit_pct)
         else:
             log.warning("TG alert FAILED: %s", symbol)

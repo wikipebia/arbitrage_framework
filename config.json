@@ -150,7 +150,10 @@
     "max_ticker_age_sec": 60.0,
     "max_bid_ask_spread_pct": 3.0,
     "confirm_top_n": 5,
-    "confirm_min_spread_pct": 0.5
+    "confirm_min_spread_pct": 0.5,
+    "symbol_blacklist": [],
+    "filter_leveraged_tokens": true,
+    "check_deposit_withdraw": true
   },
 
   "lag_monitor": {
@@ -167,7 +170,8 @@
     "bot_token": "",
     "chat_id": "",
     "min_profit_pct_alert": 0.5,
-    "alert_cooldown_sec": 30
+    "alert_cooldown_sec": 30,
+    "max_alerts_per_cycle": 10
   },
 
   "database": {
