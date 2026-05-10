@@ -125,6 +125,14 @@ class TelegramNotifier:
         estimated_profit_usd: float = 0.0,
         direction: str = "",
         contract_address: str = "",
+        buy_fee_pct: float = 0.0,
+        sell_fee_pct: float = 0.0,
+        withdraw_fee_token: float = 0.0,
+        withdraw_fee_usd: float = 0.0,
+        network_fee_usd: float = 0.0,
+        transfer_network: str = "",
+        position_usd: float = 500.0,
+        token_name: str = "",
     ) -> None:
         if not self._enabled:
             return
@@ -139,6 +147,18 @@ class TelegramNotifier:
             return
 
         vol_str = f"${volume_24h:,.0f}" if volume_24h else "N/A"
+        tok = token_name or (symbol.split("/")[0] if "/" in symbol else symbol)
+
+        buy_fee_usd = position_usd * buy_fee_pct / 100.0
+        sell_fee_usd = position_usd * sell_fee_pct / 100.0
+        total_fees_usd = buy_fee_usd + sell_fee_usd + withdraw_fee_usd + network_fee_usd
+
+        net_after_withdraw = estimated_profit_usd - withdraw_fee_usd
+        net_after_withdraw_pct = net_after_withdraw / position_usd * 100.0 if position_usd > 0 else 0.0
+
+        net_label = f"${net_after_withdraw:.2f}" if withdraw_fee_usd > 0 else f"${estimated_profit_usd:.2f}"
+        net_pct_label = f"{net_after_withdraw_pct:+.2f}%" if withdraw_fee_usd > 0 else f"{net_profit_pct:+.3f}%"
+
         text = (
             f"<b>ARBITRAGE {direction}</b>\n"
             f"\n"
@@ -146,13 +166,45 @@ class TelegramNotifier:
             f"Buy:  <code>{buy_exchange}</code> @ <code>{buy_price:.6f}</code>\n"
             f"Sell: <code>{sell_exchange}</code> @ <code>{sell_price:.6f}</code>\n"
             f"\n"
-            f"Spread:     <b>{spread_pct:+.3f}%</b>\n"
-            f"Net profit: <b>{net_profit_pct:+.3f}%</b>\n"
-            f"Est. profit: <b>${estimated_profit_usd:.2f}</b>\n"
+            f"Spread: <b>{spread_pct:+.3f}%</b>\n"
             f"Volume 24h: {vol_str}\n"
         )
+
+        text += (
+            f"\n<b>--- Costs (on ${position_usd:.0f}) ---</b>\n"
+            f"Buy fee ({buy_fee_pct:.2f}%):   ${buy_fee_usd:.2f}\n"
+            f"Sell fee ({sell_fee_pct:.2f}%):  ${sell_fee_usd:.2f}\n"
+        )
+        if transfer_network:
+            wf_str = f"{withdraw_fee_token:.4f} {tok}" if withdraw_fee_token > 0 else "free"
+            text += f"Withdraw ({transfer_network}): {wf_str} (${withdraw_fee_usd:.2f})\n"
+        else:
+            text += f"Withdraw fee: ${withdraw_fee_usd:.2f}\n"
+        if network_fee_usd > 0:
+            text += f"Network fee:  ${network_fee_usd:.2f}\n"
+        text += (
+            f"<b>Total fees:   ${total_fees_usd:.2f}</b>\n"
+            f"\n"
+            f"<b>NET profit: {net_pct_label} = {net_label}</b>\n"
+        )
+
         if contract_address:
             text += f"\nContract: <code>{contract_address}</code>\n"
+
+        text += (
+            f"\n<b>--- Action plan ---</b>\n"
+            f"1. Have USDT on <code>{buy_exchange}</code>\n"
+            f"2. Buy <b>{tok}</b> at market on <code>{buy_exchange}</code>\n"
+        )
+        if transfer_network:
+            text += f"3. Withdraw {tok} via <b>{transfer_network}</b> to <code>{sell_exchange}</code>\n"
+        else:
+            text += f"3. Withdraw {tok} to <code>{sell_exchange}</code>\n"
+        text += (
+            f"4. Sell <b>{tok}</b> at market on <code>{sell_exchange}</code>\n"
+            f"5. Profit ~ {net_label}\n"
+        )
+
         ok = await self.send_message(text)
         if ok:
             self._cycle_alert_count += 1

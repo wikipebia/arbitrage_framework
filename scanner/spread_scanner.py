@@ -183,6 +183,7 @@ class SpreadScanner:
         self._deposit_withdraw_cache: dict[str, dict[str, bool]] = {}
         self._network_status: dict[str, dict[str, dict[str, dict[str, bool]]]] = {}
         self._contract_addresses: dict[str, dict[str, str]] = {}
+        self._network_withdraw_fees: dict[str, dict[str, dict[str, float]]] = {}
         self._persistent_spread: dict[str, int] = defaultdict(int)
 
     async def _init_exchanges(self) -> None:
@@ -356,8 +357,32 @@ class SpreadScanner:
                                 if addr and code not in contracts:
                                     contracts[code] = addr
                             net_status[code] = code_nets
+                    withdraw_fees: dict[str, dict[str, float]] = {}
+                    for code, info in currencies.items():
+                        networks = info.get('networks') or {}
+                        if networks:
+                            code_wfees: dict[str, float] = {}
+                            for net_name, net_info in networks.items():
+                                norm = _normalize_network(net_name)
+                                fee_val = net_info.get('fee')
+                                if fee_val is not None:
+                                    try:
+                                        code_wfees[norm] = float(fee_val)
+                                    except (TypeError, ValueError):
+                                        pass
+                            if code_wfees:
+                                withdraw_fees[code] = code_wfees
+                        else:
+                            fee_val = info.get('fee')
+                            if fee_val is not None:
+                                try:
+                                    withdraw_fees[code] = {"_default": float(fee_val)}
+                                except (TypeError, ValueError):
+                                    pass
                     self._deposit_withdraw_cache[name] = status
                     self._network_status[name] = net_status
+                    if withdraw_fees:
+                        self._network_withdraw_fees[name] = withdraw_fees
                     if contracts:
                         self._contract_addresses[name] = contracts
                     log.info(
@@ -375,6 +400,34 @@ class SpreadScanner:
             "Deposit/withdraw status loaded for %d/%d exchanges",
             len(self._deposit_withdraw_cache), len(self._exchanges),
         )
+
+    def _get_best_transfer_info(
+        self, symbol: str, buy_exchange: str, sell_exchange: str,
+    ) -> dict:
+        """Find the cheapest common network and return transfer details."""
+        base = symbol.split("/")[0] if "/" in symbol else symbol
+        buy_nets = (self._network_status.get(buy_exchange) or {}).get(base)
+        sell_nets = (self._network_status.get(sell_exchange) or {}).get(base)
+        buy_wfees = (self._network_withdraw_fees.get(buy_exchange) or {}).get(base, {})
+
+        if not buy_nets or not sell_nets:
+            return {"network": "", "withdraw_fee": 0.0}
+
+        candidates: list[tuple[str, float]] = []
+        for net, buy_info in buy_nets.items():
+            if not buy_info.get("withdraw", False):
+                continue
+            sell_info = sell_nets.get(net)
+            if sell_info and sell_info.get("deposit", False):
+                fee = buy_wfees.get(net, 0.0)
+                candidates.append((net, fee))
+
+        if not candidates:
+            return {"network": "", "withdraw_fee": 0.0}
+
+        candidates.sort(key=lambda x: x[1])
+        best_net, best_fee = candidates[0]
+        return {"network": best_net.upper(), "withdraw_fee": best_fee}
 
     def _get_contract_address(self, base_currency: str) -> str:
         """Look up smart contract address for a currency across all exchanges."""
@@ -786,6 +839,11 @@ class SpreadScanner:
                             continue
                         base = opp.symbol.split('/')[0] if '/' in opp.symbol else opp.symbol
                         contract = self._get_contract_address(base)
+                        transfer = self._get_best_transfer_info(
+                            opp.symbol, opp.buy_exchange, opp.sell_exchange,
+                        )
+                        w_fee_token = transfer["withdraw_fee"]
+                        w_fee_usd = w_fee_token * opp.buy_price if opp.buy_price > 0 else 0.0
                         await self._notifier.alert_opportunity(
                             symbol=opp.symbol,
                             buy_exchange=opp.buy_exchange,
@@ -798,6 +856,14 @@ class SpreadScanner:
                             estimated_profit_usd=opp.estimated_profit_usd,
                             direction=opp.direction,
                             contract_address=contract,
+                            buy_fee_pct=opp.buy_fee_pct,
+                            sell_fee_pct=opp.sell_fee_pct,
+                            withdraw_fee_token=w_fee_token,
+                            withdraw_fee_usd=w_fee_usd,
+                            network_fee_usd=opp.network_fee_usd,
+                            transfer_network=transfer["network"],
+                            position_usd=opp.position_usd,
+                            token_name=base,
                         )
                 else:
                     log.info(
