@@ -309,7 +309,7 @@ class LagMonitor:
                     lag_sec >= self._lag_threshold
                     and (now - state.last_log_ts) > 30.0
                 ):
-                    log.info(
+                    log.debug(
                         "LAGGING NOW   %-20s %-16s %s  ref=%.6g  ex=%.6g  "
                         "ref_move=%+.3f%%  lag=%.2fs (ongoing)",
                         name, symbol, dir_str,

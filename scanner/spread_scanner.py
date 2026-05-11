@@ -30,6 +30,9 @@ MAX_EXCHANGE_ERRORS = 10
 AUTO_BLACKLIST_THRESHOLD = 3  # auto-blacklist after N consecutive anomalous cycles
 ANOMALOUS_SPREAD_PCT = 30.0  # spreads above this are considered anomalous
 PERSISTENT_SPREAD_CYCLES = 5  # skip opportunity after N consecutive confirmed cycles
+PERSISTENT_BLOCK_SEC = 1800  # block persistent spreads for 30 minutes
+CONFIRM_TIMEOUT_SEC = 15  # timeout for confirming a single opportunity
+CYCLE_CONFIRM_TIMEOUT_SEC = 45  # timeout for the entire confirmation phase
 
 LEVERAGED_TOKEN_RE = re.compile(
     r"\d+[SLsl]/|UP/|DOWN/|BULL/|BEAR/|HALF/|EDGE/"
@@ -187,6 +190,7 @@ class SpreadScanner:
         self._contract_addresses: dict[str, dict[str, str]] = {}
         self._network_withdraw_fees: dict[str, dict[str, dict[str, float]]] = {}
         self._persistent_spread: dict[str, int] = defaultdict(int)
+        self._persistent_blocked_until: dict[str, float] = {}  # key -> monotonic timestamp
 
     async def _init_exchanges(self) -> None:
         for cfg in self._exchange_configs:
@@ -259,9 +263,9 @@ class SpreadScanner:
         Real arbitrage closes within seconds. If the same symbol+direction
         is confirmed for PERSISTENT_SPREAD_CYCLES in a row the spread is
         structural (different networks, suspended transfers missed by the
-        currency-level check, etc.) and should be skipped — but NOT
-        permanently blacklisted so that legitimate future opportunities
-        on the same symbol still pass.
+        currency-level check, etc.) and should be blocked for
+        PERSISTENT_BLOCK_SEC (30 min by default), then re-checked once.
+        If still present — block for another hour, and so on (exponential).
         """
         confirmed_keys: set[str] = set()
         for opp in confirmed:
@@ -275,18 +279,45 @@ class SpreadScanner:
                 if self._persistent_spread[key] == PERSISTENT_SPREAD_CYCLES:
                     sym = key.split("|")[0]
                     route = key.split("|")[1]
+                    streak = self._persistent_spread[key]
+                    multiplier = max(1, (streak - PERSISTENT_SPREAD_CYCLES) // PERSISTENT_SPREAD_CYCLES + 1)
+                    block_sec = PERSISTENT_BLOCK_SEC * multiplier
+                    self._persistent_blocked_until[key] = time.monotonic() + block_sec
                     log.warning(
                         "Persistent spread detected: %s (%s) — "
-                        "confirmed %d consecutive cycles, skipping until spread changes",
-                        sym, route, PERSISTENT_SPREAD_CYCLES,
+                        "confirmed %d consecutive cycles, blocking for %d min",
+                        sym, route, PERSISTENT_SPREAD_CYCLES, block_sec // 60,
+                    )
+                elif self._persistent_spread[key] > PERSISTENT_SPREAD_CYCLES:
+                    sym = key.split("|")[0]
+                    route = key.split("|")[1]
+                    streak = self._persistent_spread[key]
+                    multiplier = max(1, (streak - PERSISTENT_SPREAD_CYCLES) // PERSISTENT_SPREAD_CYCLES + 1)
+                    block_sec = PERSISTENT_BLOCK_SEC * multiplier
+                    self._persistent_blocked_until[key] = time.monotonic() + block_sec
+                    log.warning(
+                        "Persistent spread still active: %s (%s) — "
+                        "streak %d, blocking for %d min",
+                        sym, route, streak, block_sec // 60,
                     )
             else:
                 self._persistent_spread.pop(key, None)
+                self._persistent_blocked_until.pop(key, None)
 
     def _is_persistent_spread(self, opp: Opportunity) -> bool:
-        """Check if this opportunity has been persistent (likely unexecutable)."""
+        """Check if this opportunity is currently blocked as a persistent spread."""
         key = f"{opp.symbol}|{opp.buy_exchange}->{opp.sell_exchange}"
-        return self._persistent_spread.get(key, 0) >= PERSISTENT_SPREAD_CYCLES
+        blocked_until = self._persistent_blocked_until.get(key)
+        if blocked_until is not None:
+            if time.monotonic() < blocked_until:
+                return True
+            self._persistent_blocked_until.pop(key, None)
+            self._persistent_spread[key] = 0
+            log.info(
+                "Persistent spread block expired for %s (%s), re-checking",
+                opp.symbol, f"{opp.buy_exchange}->{opp.sell_exchange}",
+            )
+        return False
 
     def _update_auto_blacklist(self, opportunities: list[Opportunity]) -> int:
         """Track symbols with anomalous spreads; auto-blacklist persistent ones."""
@@ -553,31 +584,44 @@ class SpreadScanner:
         return ba_spread_pct <= self._max_bid_ask_spread
 
     async def _confirm_opportunity(self, opp: Opportunity) -> Opportunity | None:
-        """Re-fetch tickers + orderbooks for buy and sell exchanges to confirm spread."""
+        """Re-fetch tickers + orderbooks for buy and sell exchanges to confirm spread.
+
+        Has a per-opportunity timeout (CONFIRM_TIMEOUT_SEC) to prevent
+        a single hung API call from stalling the entire cycle.
+        """
         buy_ex = self._exchanges.get(opp.buy_exchange)
         sell_ex = self._exchanges.get(opp.sell_exchange)
         if not buy_ex or not sell_ex:
             return None
 
         try:
-            buy_ticker, sell_ticker, buy_ob, sell_ob = await asyncio.gather(
-                _retry_async(
-                    lambda be=buy_ex: be.fetch_ticker(opp.symbol),
-                    max_retries=1, base_delay=0.5,
+            buy_ticker, sell_ticker, buy_ob, sell_ob = await asyncio.wait_for(
+                asyncio.gather(
+                    _retry_async(
+                        lambda be=buy_ex: be.fetch_ticker(opp.symbol),
+                        max_retries=1, base_delay=0.5,
+                    ),
+                    _retry_async(
+                        lambda se=sell_ex: se.fetch_ticker(opp.symbol),
+                        max_retries=1, base_delay=0.5,
+                    ),
+                    _retry_async(
+                        lambda be=buy_ex, s=opp.symbol: be.fetch_order_book(s, limit=self._ob_depth),
+                        max_retries=1, base_delay=0.5,
+                    ),
+                    _retry_async(
+                        lambda se=sell_ex, s=opp.symbol: se.fetch_order_book(s, limit=self._ob_depth),
+                        max_retries=1, base_delay=0.5,
+                    ),
                 ),
-                _retry_async(
-                    lambda se=sell_ex: se.fetch_ticker(opp.symbol),
-                    max_retries=1, base_delay=0.5,
-                ),
-                _retry_async(
-                    lambda be=buy_ex, s=opp.symbol: be.fetch_order_book(s, limit=self._ob_depth),
-                    max_retries=1, base_delay=0.5,
-                ),
-                _retry_async(
-                    lambda se=sell_ex, s=opp.symbol: se.fetch_order_book(s, limit=self._ob_depth),
-                    max_retries=1, base_delay=0.5,
-                ),
+                timeout=CONFIRM_TIMEOUT_SEC,
             )
+        except asyncio.TimeoutError:
+            log.warning(
+                "Confirm timeout (%ds) for %s [%s->%s]",
+                CONFIRM_TIMEOUT_SEC, opp.symbol, opp.buy_exchange, opp.sell_exchange,
+            )
+            return None
         except Exception:
             return None
 
@@ -802,7 +846,17 @@ class SpreadScanner:
                 duration = time.time() - t0
 
                 if opportunities:
-                    top_to_confirm = opportunities[:self._confirm_top_n]
+                    # Filter out currently-blocked persistent spreads BEFORE confirmation
+                    # to avoid wasting API calls on known structural spreads
+                    pre_filtered = [
+                        opp for opp in opportunities
+                        if not self._is_persistent_spread(opp)
+                    ]
+                    persistent_skipped = len(opportunities) - len(pre_filtered)
+                    if persistent_skipped > 0:
+                        stats["persistent_blocked"] = persistent_skipped
+
+                    top_to_confirm = pre_filtered[:self._confirm_top_n]
                     confirmed: list[Opportunity] = []
 
                     if self._confirm_top_n > 0:
@@ -810,9 +864,19 @@ class SpreadScanner:
                             self._confirm_opportunity(opp)
                             for opp in top_to_confirm
                         ]
-                        confirm_results = await asyncio.gather(
-                            *confirm_tasks, return_exceptions=True
-                        )
+                        try:
+                            confirm_results = await asyncio.wait_for(
+                                asyncio.gather(
+                                    *confirm_tasks, return_exceptions=True
+                                ),
+                                timeout=CYCLE_CONFIRM_TIMEOUT_SEC,
+                            )
+                        except asyncio.TimeoutError:
+                            log.warning(
+                                "Cycle confirmation phase timed out (%ds)",
+                                CYCLE_CONFIRM_TIMEOUT_SEC,
+                            )
+                            confirm_results = []
                         for r in confirm_results:
                             if isinstance(r, Opportunity):
                                 confirmed.append(r)
@@ -821,7 +885,7 @@ class SpreadScanner:
                             len(top_to_confirm) - len(confirmed)
                         )
 
-                    remaining = opportunities[self._confirm_top_n:]
+                    remaining = pre_filtered[self._confirm_top_n:]
                     all_valid = confirmed + remaining
 
                     new_bl = self._update_auto_blacklist(opportunities)
@@ -836,7 +900,8 @@ class SpreadScanner:
                         f"stale={stats.get('stale_tickers', 0)} "
                         f"wide_ba={stats.get('wide_bid_ask', 0)} "
                         f"low_vol={stats.get('low_volume', 0)} "
-                        f"xfer_blocked={stats.get('transfer_blocked', 0)}"
+                        f"xfer_blocked={stats.get('transfer_blocked', 0)} "
+                        f"persistent={stats.get('persistent_blocked', 0)}"
                     )
                     confirm_log = ""
                     if self._confirm_top_n > 0:
