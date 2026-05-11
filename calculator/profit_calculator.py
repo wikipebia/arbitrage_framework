@@ -33,8 +33,16 @@ class Opportunity:
     position_usd: float
     estimated_profit_usd: float
     direction: str
+    slippage_buy_pct: float = 0.0
+    slippage_sell_pct: float = 0.0
+    ob_fill_buy: float = 0.0
+    ob_fill_sell: float = 0.0
+    ob_depth_ok: bool = True
 
     def __str__(self) -> str:
+        slip = ""
+        if self.slippage_buy_pct > 0 or self.slippage_sell_pct > 0:
+            slip = f" | slip: {self.slippage_buy_pct:.2f}%/{self.slippage_sell_pct:.2f}%"
         return (
             f"[{self.direction}] {self.symbol:<14} | "
             f"buy {self.buy_exchange}: {self.buy_price:.6f} | "
@@ -42,8 +50,42 @@ class Opportunity:
             f"gross: {self.gross_spread_pct:+.3f}% | "
             f"NET: {self.net_profit_pct:+.3f}% | "
             f"~${self.estimated_profit_usd:.2f} | "
-            f"vol: ${self.volume_24h:,.0f}"
+            f"vol: ${self.volume_24h:,.0f}{slip}"
         )
+
+
+def calc_fill_price(
+    orders: list[list[float]], amount_usd: float, side: str,
+) -> tuple[float, bool]:
+    """Walk an orderbook side and return (avg_fill_price, depth_sufficient).
+
+    Args:
+        orders: [[price, qty], ...] — asks sorted asc or bids sorted desc.
+        amount_usd: target fill amount in USD.
+        side: 'buy' (walk asks) or 'sell' (walk bids).
+
+    Returns:
+        (volume-weighted average fill price, whether full amount was filled).
+    """
+    filled_usd = 0.0
+    filled_qty = 0.0
+    for price, qty in orders:
+        if price <= 0 or qty <= 0:
+            continue
+        level_usd = price * qty
+        remaining = amount_usd - filled_usd
+        if level_usd >= remaining:
+            fill_qty = remaining / price
+            filled_qty += fill_qty
+            filled_usd += remaining
+            break
+        else:
+            filled_qty += qty
+            filled_usd += level_usd
+    if filled_qty <= 0:
+        return 0.0, False
+    avg_price = filled_usd / filled_qty
+    return avg_price, filled_usd >= amount_usd * 0.95
 
 
 class ProfitCalculator:

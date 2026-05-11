@@ -133,6 +133,9 @@ class TelegramNotifier:
         transfer_network: str = "",
         position_usd: float = 500.0,
         token_name: str = "",
+        slippage_buy_pct: float = 0.0,
+        slippage_sell_pct: float = 0.0,
+        ob_depth_ok: bool = True,
     ) -> None:
         if not self._enabled:
             return
@@ -182,11 +185,18 @@ class TelegramNotifier:
             text += f"Withdraw fee: ${withdraw_fee_usd:.2f}\n"
         if network_fee_usd > 0:
             text += f"Network fee:  ${network_fee_usd:.2f}\n"
+        total_slip = slippage_buy_pct + slippage_sell_pct
+        if total_slip > 0.01:
+            text += f"Slippage (OB): buy {slippage_buy_pct:.2f}% + sell {slippage_sell_pct:.2f}%\n"
+        if not ob_depth_ok:
+            text += "\u26a0\ufe0f OB depth insufficient for full fill!\n"
         text += (
             f"<b>Total fees:   ${total_fees_usd:.2f}</b>\n"
             f"\n"
             f"<b>NET profit: {net_pct_label} = {net_label}</b>\n"
         )
+        if total_slip > 0.01:
+            text += f"(prices from orderbook, slippage included)\n"
 
         if contract_address:
             text += f"\nContract: <code>{contract_address}</code>\n"

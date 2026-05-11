@@ -20,7 +20,7 @@ from collections import defaultdict
 
 import ccxt.async_support as ccxt
 
-from calculator.profit_calculator import ProfitCalculator, Opportunity
+from calculator.profit_calculator import ProfitCalculator, Opportunity, calc_fill_price
 from notifications.telegram_bot import TelegramNotifier
 from storage.db import ArbitrageDB
 
@@ -153,6 +153,7 @@ class SpreadScanner:
         symbol_blacklist: list[str] | None = None,
         filter_leveraged_tokens: bool = True,
         check_deposit_withdraw: bool = True,
+        orderbook_depth: int = 20,
     ):
         self._exchange_configs = exchange_configs
         self._calculator = calculator
@@ -173,6 +174,7 @@ class SpreadScanner:
         self._confirm_min_spread = confirm_min_spread_pct
         self._filter_leveraged = filter_leveraged_tokens
         self._check_deposit_withdraw = check_deposit_withdraw
+        self._ob_depth = orderbook_depth
         self._exchanges: dict[str, ccxt.Exchange] = {}
         self._exchange_errors: dict[str, int] = defaultdict(int)
         self._exchange_fetch_latency: dict[str, float] = {}
@@ -551,20 +553,28 @@ class SpreadScanner:
         return ba_spread_pct <= self._max_bid_ask_spread
 
     async def _confirm_opportunity(self, opp: Opportunity) -> Opportunity | None:
-        """Re-fetch tickers for buy and sell exchanges to confirm spread."""
+        """Re-fetch tickers + orderbooks for buy and sell exchanges to confirm spread."""
         buy_ex = self._exchanges.get(opp.buy_exchange)
         sell_ex = self._exchanges.get(opp.sell_exchange)
         if not buy_ex or not sell_ex:
             return None
 
         try:
-            buy_ticker, sell_ticker = await asyncio.gather(
+            buy_ticker, sell_ticker, buy_ob, sell_ob = await asyncio.gather(
                 _retry_async(
                     lambda be=buy_ex: be.fetch_ticker(opp.symbol),
                     max_retries=1, base_delay=0.5,
                 ),
                 _retry_async(
                     lambda se=sell_ex: se.fetch_ticker(opp.symbol),
+                    max_retries=1, base_delay=0.5,
+                ),
+                _retry_async(
+                    lambda be=buy_ex, s=opp.symbol: be.fetch_order_book(s, limit=self._ob_depth),
+                    max_retries=1, base_delay=0.5,
+                ),
+                _retry_async(
+                    lambda se=sell_ex, s=opp.symbol: se.fetch_order_book(s, limit=self._ob_depth),
                     max_retries=1, base_delay=0.5,
                 ),
             )
@@ -595,15 +605,45 @@ class SpreadScanner:
         if min_vol < self._min_volume:
             return None
 
+        fill_buy = new_ask
+        fill_sell = new_bid
+        slip_buy = 0.0
+        slip_sell = 0.0
+        depth_ok = True
+        pos = self._calculator._position_usd
+
+        if buy_ob and buy_ob.get("asks"):
+            fill_buy, buy_filled = calc_fill_price(buy_ob["asks"], pos, "buy")
+            if fill_buy <= 0:
+                fill_buy = new_ask
+            else:
+                slip_buy = (fill_buy - new_ask) / new_ask * 100.0 if new_ask > 0 else 0.0
+                if not buy_filled:
+                    depth_ok = False
+
+        if sell_ob and sell_ob.get("bids"):
+            fill_sell, sell_filled = calc_fill_price(sell_ob["bids"], pos, "sell")
+            if fill_sell <= 0:
+                fill_sell = new_bid
+            else:
+                slip_sell = (new_bid - fill_sell) / new_bid * 100.0 if new_bid > 0 else 0.0
+                if not sell_filled:
+                    depth_ok = False
+
         confirmed = self._calculator.calculate(
             symbol=opp.symbol,
             buy_exchange=opp.buy_exchange,
             sell_exchange=opp.sell_exchange,
-            buy_price=new_ask,
-            sell_price=new_bid,
+            buy_price=fill_buy,
+            sell_price=fill_sell,
             volume_24h=min_vol,
         )
         if confirmed and confirmed.net_profit_pct >= self._confirm_min_spread:
+            confirmed.slippage_buy_pct = round(slip_buy, 4)
+            confirmed.slippage_sell_pct = round(slip_sell, 4)
+            confirmed.ob_fill_buy = round(fill_buy, 8)
+            confirmed.ob_fill_sell = round(fill_sell, 8)
+            confirmed.ob_depth_ok = depth_ok
             return confirmed
         return None
 
@@ -864,6 +904,9 @@ class SpreadScanner:
                             transfer_network=transfer["network"],
                             position_usd=opp.position_usd,
                             token_name=base,
+                            slippage_buy_pct=opp.slippage_buy_pct,
+                            slippage_sell_pct=opp.slippage_sell_pct,
+                            ob_depth_ok=opp.ob_depth_ok,
                         )
                 else:
                     log.info(

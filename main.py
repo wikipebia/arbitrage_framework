@@ -116,6 +116,7 @@ async def run(config: dict, scanner_only: bool, lag_only: bool) -> None:
             symbol_blacklist=scanner_cfg.get("symbol_blacklist"),
             filter_leveraged_tokens=scanner_cfg.get("filter_leveraged_tokens", True),
             check_deposit_withdraw=scanner_cfg.get("check_deposit_withdraw", True),
+            orderbook_depth=scanner_cfg.get("orderbook_depth", 20),
         )
 
         exchange_names = [e["id"] for e in enabled_exchanges]
